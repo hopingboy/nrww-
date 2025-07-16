@@ -1,83 +1,106 @@
-name: KVM Ubuntu‑22.04 VM (persistent)
+name: Persistent KVM Ubuntu‑22.04 with tmate
 
 on:
-  push:
   workflow_dispatch:
+  push:
 
 jobs:
   kvm-vm:
-    runs-on: self-hosted   # host must expose /dev/kvm
+    runs-on: self-hosted   # must have /dev/kvm
     steps:
     # ───────────────────────────────────────────────────────────
-    - name: Prep host & VM (idempotent)
+    - name: Prepare host & boot VM
+      id: prep
       shell: bash
       run: |
         set -euo pipefail
 
-        # ----- VARIABLES -----------------------------------------------------
+        # ----- CONFIG -------------------------------------------------------
         VM_NAME="gha-ubuntu22"
         WORKDIR="/var/lib/vm-images"
         BASE_IMG="$WORKDIR/ubuntu-22.04-base.qcow2"
         DISK="$WORKDIR/${VM_NAME}.qcow2"
         SEED="$WORKDIR/${VM_NAME}-seed.img"
-        SIZE_GB=20
-        RAM_MB=4096
+        SIZE_GB=15           # shrink a bit → lighter
+        RAM_MB=2048          # lighter footprint
         CPUS=2
         IMG_URL="https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img"
-        TIMER_UNIT="/etc/systemd/system/${VM_NAME}-reboot.timer"
-        SERVICE_UNIT="/etc/systemd/system/${VM_NAME}-reboot.service"
-        # DHCP address for libvirt default network (first lease)
-        GUEST_IP="192.168.122.100"
+        GUEST_IP="192.168.122.100"   # first DHCP lease on libvirt default
+        REBOOT_TIMER="${VM_NAME}-reboot.timer"
+        REBOOT_SERVICE="${VM_NAME}-reboot.service"
 
         sudo mkdir -p "$WORKDIR"
-        sudo chown "$(id -u):$(id -g)" "$WORKDIR"
+        sudo chown "$(id -u)":"$(id -g)" "$WORKDIR"
 
-        # ----- PACKAGES ------------------------------------------------------
-        if ! command -v qemu-system-x86_64 >/dev/null; then
-          sudo apt update
-          sudo apt install -y qemu-system-x86 qemu-utils libvirt-daemon-system \
-                              libvirt-clients cloud-image-utils openssh-client \
-                              sshpass
-          sudo systemctl enable --now libvirtd
-        fi
+        # ----- MINIMAL PKGS --------------------------------------------------
+        sudo apt-get update -qq
+        sudo apt-get install -yqq \
+             qemu-system-x86 qemu-utils libvirt-daemon-system libvirt-clients \
+             cloud-image-utils sshpass
 
-        # ----- BASE IMAGE (download once) ------------------------------------
+        sudo systemctl enable --now libvirtd
+
+        # ----- BASE IMAGE (download once, lightweight downloader) -----------
         if [[ ! -f "$BASE_IMG" ]]; then
-          echo "Downloading Ubuntu cloud image…"
-          wget -qO "$BASE_IMG" "$IMG_URL"
+          echo "🔻 Downloading Ubuntu cloud image ..."
+          if command -v aria2c >/dev/null; then
+            aria2c -x8 -s8 -d "$(dirname "$BASE_IMG")" -o "$(basename "$BASE_IMG")" "$IMG_URL"
+          else
+            wget -qO "$BASE_IMG" "$IMG_URL"
+          fi
           qemu-img resize "$BASE_IMG" ${SIZE_GB}G
         fi
 
-        # ----- DIFFERENCING DISK (persistent) --------------------------------
+        # ----- DIFFERENCING DISK --------------------------------------------
         if [[ ! -f "$DISK" ]]; then
-          echo "Creating QCOW2 differencing disk…"
+          echo "📦 Creating persistent QCOW2 disk ..."
           qemu-img create -f qcow2 -b "$BASE_IMG" "$DISK"
         fi
 
-        # ----- CLOUD‑INIT SEED ----------------------------------------------
+        # ----- CLOUD‑INIT SEED (root / root + tmate installer) --------------
         if [[ ! -f "$SEED" ]]; then
           cat > /tmp/user-data <<'EOF'
         #cloud-config
-        hostname: gha-vm
-        users:
-          - name: runner
-            sudo: ALL=(ALL) NOPASSWD:ALL
-            groups: users, admin
-            shell: /bin/bash
-            lock_passwd: false
-            plain_text_passwd: "runner"
+        disable_root: false
         ssh_pwauth: true
-        package_upgrade: true
+        password: root
+        chpasswd: { expire: False }
+        users:
+          - default
+        runcmd:
+          - |
+            apt-get update -qq
+            apt-get install -yqq tmate
+            # Create tmate session on boot
+            cat >/etc/systemd/system/tmate.service <<'EOT'
+        [Unit]
+        Description=tmate SSH sharing
+        After=network.target cloud-init.service
+
+        [Service]
+        Type=forking
+        ExecStart=/usr/bin/tmate -S /tmp/tmate.sock new-session -d
+        ExecStartPost=/usr/bin/tmate -S /tmp/tmate.sock wait tmate-ready
+        ExecStartPost=/usr/bin/tmate -S /tmp/tmate.sock display -p 'tmate-ssh %{ssh-conn}' > /run/tmate_ssh.txt
+        ExecStartPost=/usr/bin/tmate -S /tmp/tmate.sock display -p 'tmate-web %{web}' >> /run/tmate_ssh.txt
+        Restart=always
+        RestartSec=5
+
+        [Install]
+        WantedBy=multi-user.target
+EOT
+            systemctl daemon-reload
+            systemctl enable --now tmate.service
         EOF
+
           echo "instance-id: iid-${VM_NAME}" > /tmp/meta-data
-          cloud-localds "$SEED" /tmp/user-data /tmp/meta-data
+          sudo cloud-localds "$SEED" /tmp/user-data /tmp/meta-data
         fi
 
-        # ----- DEFINE VM IF NEEDED ------------------------------------------
+        # ----- DEFINE (if first time) ---------------------------------------
         if ! sudo virsh dominfo "$VM_NAME" &>/dev/null; then
-          echo "Defining VM $VM_NAME…"
-          sudo virt-install \
-            --name "$VM_NAME" \
+          echo "🖧 Defining VM $VM_NAME ..."
+          sudo virt-install --name "$VM_NAME" \
             --memory "$RAM_MB" --vcpus "$CPUS" \
             --import \
             --disk path="$DISK",format=qcow2 \
@@ -87,64 +110,63 @@ jobs:
             --noautoconsole
         fi
 
-        # ----- SYSTEMD TIMER FOR 6‑HOUR REBOOTS -----------------------------
-        if [[ ! -f "$SERVICE_UNIT" ]]; then
-          echo "Creating systemd units for periodic reboot…"
-          sudo tee "$SERVICE_UNIT" >/dev/null <<EOF
+        # ----- SYSTEMD TIMER (6‑hour reboot) -------------------------------
+        if [[ ! -f "/etc/systemd/system/$REBOOT_SERVICE" ]]; then
+          echo "🔄 Setting up 6‑hour reboot timer ..."
+          sudo bash -c "cat >/etc/systemd/system/$REBOOT_SERVICE" <<EOF
         [Unit]
         Description=Reboot $VM_NAME safely
 
         [Service]
         Type=oneshot
         ExecStart=/usr/bin/virsh reboot $VM_NAME --mode=agent
-        EOF
-        fi
-
-        if [[ ! -f "$TIMER_UNIT" ]]; then
-          sudo tee "$TIMER_UNIT" >/dev/null <<EOF
+EOF
+          sudo bash -c "cat >/etc/systemd/system/$REBOOT_TIMER" <<EOF
         [Unit]
         Description=Reboot $VM_NAME every 6 hours
-
         [Timer]
         OnCalendar=*-*-* *:00:00/6
         Persistent=true
-
         [Install]
         WantedBy=timers.target
-        EOF
+EOF
           sudo systemctl daemon-reload
-          sudo systemctl enable --now "$(basename "$TIMER_UNIT")"
+          sudo systemctl enable --now "$REBOOT_TIMER"
         fi
 
-        # ----- START VM ------------------------------------------------------
+        # ----- BOOT ---------------------------------------------------------
         sudo virsh start "$VM_NAME" || true
 
-        # ----- WAIT FOR SSH --------------------------------------------------
-        echo "Waiting for SSH on $GUEST_IP…"
+        # ----- WAIT FOR SSH (root / root) -----------------------------------
+        echo "⏳ Waiting for SSH on $GUEST_IP ..."
         for i in {1..40}; do
-          if sshpass -prunner ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 runner@$GUEST_IP 'echo ok' 2>/dev/null; then
-            echo "✅ VM is up"
-            exit 0
+          if sshpass -proot ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@$GUEST_IP 'echo ok' 2>/dev/null; then
+            echo "✅ Guest is up"
+            break
           fi
           sleep 5
         done
-        echo "❌ Timed out waiting for VM SSH" && exit 1
+
+        # ----- FETCH tmate URL ---------------------------------------------
+        echo "📡 Waiting for tmate URL ..."
+        for i in {1..40}; do
+          if sshpass -proot ssh -o StrictHostKeyChecking=no root@$GUEST_IP 'cat /run/tmate_ssh.txt 2>/dev/null' >tmate_url.txt 2>/dev/null; then
+            break
+          fi
+          sleep 5
+        done
+        echo "tmate-url<<EOF" >> "$GITHUB_OUTPUT"
+        cat tmate_url.txt >> "$GITHUB_OUTPUT"
+        echo "EOF" >> "$GITHUB_OUTPUT"
 
     # ───────────────────────────────────────────────────────────
-    - name: Do work inside the VM
-      shell: bash
+    - name: ⭐ tmate — connect here
       run: |
-        GUEST_IP="192.168.122.100"
-        sshpass -prunner ssh -o StrictHostKeyChecking=no runner@$GUEST_IP <<'EOSSH'
-          set -eux
-          echo "Running inside guest at $(hostname) $(date)"
-          # ── Replace the following with your build / test / deploy steps ──
-          sudo apt-get update -qq
-          sudo apt-get install -yqq neofetch
-          neofetch
-        EOSSH
+        echo "---------------------------------------------------------"
+        echo "${{ steps.prep.outputs.tmate-url }}"
+        echo "---------------------------------------------------------"
 
     # ───────────────────────────────────────────────────────────
-    - name: (Optional) shutdown VM when job is done
-      if: always()
-      run: sudo virsh shutdown gha-ubuntu22 || true
+    - name: Example command inside guest
+      run: |
+        sshpass -proot ssh -o StrictHostKeyChecking=no root@192.168.122.100 'ls -al /root'
