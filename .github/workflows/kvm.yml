@@ -1,0 +1,132 @@
+name: Persistent KVM Ubuntu VM with tmate access
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  run-kvm-vm:
+    runs-on: self-hosted
+    steps:
+      - name: Setup and Boot KVM VM
+        id: vm
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          # CONFIG
+          VM_NAME="gha-vm"
+          WORKDIR="/var/lib/vm-images"
+          BASE_IMG="$WORKDIR/ubuntu-22.04-base.qcow2"
+          VM_IMG="$WORKDIR/${VM_NAME}.qcow2"
+          SEED_IMG="$WORKDIR/${VM_NAME}-seed.img"
+          RAM=2048
+          CPUS=2
+          DISK_SIZE=10G
+          IMG_URL="https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img"
+          GUEST_IP="192.168.122.100"
+          SSH_PASS="root"
+
+          sudo mkdir -p "$WORKDIR"
+          sudo apt update -qq
+          sudo apt install -yqq qemu-system-x86 qemu-utils libvirt-daemon-system libvirt-clients cloud-image-utils sshpass tmate wget
+          sudo systemctl enable --now libvirtd
+
+          # Download base image if not exists
+          if [[ ! -f "$BASE_IMG" ]]; then
+            echo "Downloading base cloud image..."
+            wget -qO "$BASE_IMG" "$IMG_URL"
+            qemu-img resize "$BASE_IMG" "$DISK_SIZE"
+          fi
+
+          # Create persistent VM disk if not exists
+          if [[ ! -f "$VM_IMG" ]]; then
+            echo "Creating VM disk..."
+            qemu-img create -f qcow2 -b "$BASE_IMG" "$VM_IMG"
+          fi
+
+          # Create cloud-init seed
+          if [[ ! -f "$SEED_IMG" ]]; then
+            cat > user-data <<EOF
+#cloud-config
+disable_root: false
+ssh_pwauth: true
+password: ${SSH_PASS}
+chpasswd:
+  expire: false
+runcmd:
+  - apt update -y
+  - apt install -y tmate
+  - |
+    cat >/etc/systemd/system/tmate.service <<EOT
+[Unit]
+Description=tmate
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=/usr/bin/tmate -S /tmp/tmate.sock new-session -d
+ExecStartPost=/usr/bin/tmate -S /tmp/tmate.sock wait tmate-ready
+ExecStartPost=/usr/bin/tmate -S /tmp/tmate.sock display -p 'tmate-ssh %{ssh-conn}' > /run/tmate.txt
+ExecStartPost=/usr/bin/tmate -S /tmp/tmate.sock display -p 'tmate-web %{web}' >> /run/tmate.txt
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOT
+    systemctl daemon-reload
+    systemctl enable --now tmate.service
+EOF
+
+            echo "instance-id: iid-${VM_NAME}" > meta-data
+            sudo cloud-localds "$SEED_IMG" user-data meta-data
+          fi
+
+          # Define VM if not already
+          if ! sudo virsh dominfo "$VM_NAME" &>/dev/null; then
+            sudo virt-install \
+              --name "$VM_NAME" \
+              --memory "$RAM" \
+              --vcpus "$CPUS" \
+              --import \
+              --disk path="$VM_IMG",format=qcow2 \
+              --disk path="$SEED_IMG",device=cdrom \
+              --network network=default,model=virtio \
+              --os-type linux \
+              --os-variant ubuntu22.04 \
+              --noautoconsole
+          fi
+
+          # Start VM if not running
+          if ! sudo virsh domstate "$VM_NAME" | grep -q running; then
+            sudo virsh start "$VM_NAME"
+          fi
+
+          # Wait for SSH access
+          echo "Waiting for SSH to become available..."
+          for i in {1..40}; do
+            if sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@$GUEST_IP "echo ok" 2>/dev/null; then
+              echo "SSH is ready!"
+              break
+            fi
+            sleep 5
+          done
+
+          # Wait for tmate URL
+          echo "Waiting for tmate to initialize..."
+          for i in {1..40}; do
+            if sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no root@$GUEST_IP "cat /run/tmate.txt" > tmate.txt 2>/dev/null; then
+              break
+            fi
+            sleep 5
+          done
+
+          echo "tmate-url<<EOF" >> "$GITHUB_OUTPUT"
+          cat tmate.txt >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Show tmate SSH Access
+        run: |
+          echo "🔗 Connect to the VM with the following tmate link:"
+          echo "${{ steps.vm.outputs.tmate-url }}"
