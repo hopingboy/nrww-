@@ -1,172 +1,170 @@
-name: Persistent KVM Ubuntu‑22.04 with tmate
-
-on:
-  workflow_dispatch:
-  push:
+name: Persistent‑KVM‑Ubuntu‑22.04‑with‑tmate
+on: [push, workflow_dispatch]
 
 jobs:
   kvm-vm:
-    runs-on: self-hosted   # must have /dev/kvm
+    runs-on: self-hosted   # host must expose /dev/kvm
     steps:
-    # ───────────────────────────────────────────────────────────
-    - name: Prepare host & boot VM
-      id: prep
-      shell: bash
-      run: |
-        set -euo pipefail
+      # ───────────────────────────────────────────────────────────
+      - name: Prepare host & boot VM
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ───── CONFIG ──────────────────────────────────────────
+          VM_NAME="gha-ubuntu22"
+          WORKDIR="/var/lib/vm-images"
+          BASE_IMG="$WORKDIR/ubuntu-22.04-base.qcow2"
+          DISK="$WORKDIR/${VM_NAME}.qcow2"
+          SEED="$WORKDIR/${VM_NAME}-seed.img"
+          SIZE_GB=15
+          RAM_MB=2048
+          CPUS=2
+          IMG_URL="https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img"
+          GUEST_IP="192.168.122.100"        # libvirt default network
+          REBOOT_SERVICE="${VM_NAME}-reboot.service"
+          REBOOT_TIMER="${VM_NAME}-reboot.timer"
 
-        # ----- CONFIG -------------------------------------------------------
-        VM_NAME="gha-ubuntu22"
-        WORKDIR="/var/lib/vm-images"
-        BASE_IMG="$WORKDIR/ubuntu-22.04-base.qcow2"
-        DISK="$WORKDIR/${VM_NAME}.qcow2"
-        SEED="$WORKDIR/${VM_NAME}-seed.img"
-        SIZE_GB=15           # shrink a bit → lighter
-        RAM_MB=2048          # lighter footprint
-        CPUS=2
-        IMG_URL="https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img"
-        GUEST_IP="192.168.122.100"   # first DHCP lease on libvirt default
-        REBOOT_TIMER="${VM_NAME}-reboot.timer"
-        REBOOT_SERVICE="${VM_NAME}-reboot.service"
+          sudo mkdir -p "$WORKDIR"
+          sudo chown "$(id -u):$(id -g)" "$WORKDIR"
 
-        sudo mkdir -p "$WORKDIR"
-        sudo chown "$(id -u)":"$(id -g)" "$WORKDIR"
+          # ───── Packages (lean set) ─────────────────────────────
+          sudo apt-get update -qq
+          sudo apt-get install -yqq \
+            qemu-system-x86 qemu-utils libvirt-daemon-system libvirt-clients \
+            cloud-image-utils sshpass tmate
 
-        # ----- MINIMAL PKGS --------------------------------------------------
-        sudo apt-get update -qq
-        sudo apt-get install -yqq \
-             qemu-system-x86 qemu-utils libvirt-daemon-system libvirt-clients \
-             cloud-image-utils sshpass
+          sudo systemctl enable --now libvirtd
 
-        sudo systemctl enable --now libvirtd
-
-        # ----- BASE IMAGE (download once, lightweight downloader) -----------
-        if [[ ! -f "$BASE_IMG" ]]; then
-          echo "🔻 Downloading Ubuntu cloud image ..."
-          if command -v aria2c >/dev/null; then
-            aria2c -x8 -s8 -d "$(dirname "$BASE_IMG")" -o "$(basename "$BASE_IMG")" "$IMG_URL"
-          else
-            wget -qO "$BASE_IMG" "$IMG_URL"
+          # ───── Download base cloud image (once) ───────────────
+          if [[ ! -f "$BASE_IMG" ]]; then
+            echo "🔻 Downloading Ubuntu cloud image ..."
+            if command -v aria2c >/dev/null; then
+              aria2c -x8 -s8 -d "$(dirname "$BASE_IMG")" \
+                     -o "$(basename "$BASE_IMG")" "$IMG_URL"
+            else
+              wget -qO "$BASE_IMG" "$IMG_URL"
+            fi
+            qemu-img resize "$BASE_IMG" "${SIZE_GB}G"
           fi
-          qemu-img resize "$BASE_IMG" ${SIZE_GB}G
-        fi
 
-        # ----- DIFFERENCING DISK --------------------------------------------
-        if [[ ! -f "$DISK" ]]; then
-          echo "📦 Creating persistent QCOW2 disk ..."
-          qemu-img create -f qcow2 -b "$BASE_IMG" "$DISK"
-        fi
+          # ───── Create or reuse persistent diff‑disk ───────────
+          if [[ ! -f "$DISK" ]]; then
+            echo "📦 Creating persistent QCOW2 disk ..."
+            qemu-img create -f qcow2 -b "$BASE_IMG" "$DISK"
+          fi
 
-        # ----- CLOUD‑INIT SEED (root / root + tmate installer) --------------
-        if [[ ! -f "$SEED" ]]; then
-          cat > /tmp/user-data <<'EOF'
-        #cloud-config
-        disable_root: false
-        ssh_pwauth: true
-        password: root
-        chpasswd: { expire: False }
-        users:
-          - default
-        runcmd:
-          - |
-            apt-get update -qq
-            apt-get install -yqq tmate
-            # Create tmate session on boot
-            cat >/etc/systemd/system/tmate.service <<'EOT'
-        [Unit]
-        Description=tmate SSH sharing
-        After=network.target cloud-init.service
+          # ───── cloud‑init seed (root/root + tmate) ────────────
+          if [[ ! -f "$SEED" ]]; then
+            cat >/tmp/user-data <<'CLOUDCFG'
+#cloud-config
+disable_root: false
+ssh_pwauth: true
+password: root
+chpasswd: { expire: false }
+runcmd:
+  - |
+    apt-get update -qq
+    apt-get install -yqq tmate
+    cat >/etc/systemd/system/tmate.service <<'SERVICE'
+[Unit]
+Description=tmate session
+After=network.target cloud-final.service
 
-        [Service]
-        Type=forking
-        ExecStart=/usr/bin/tmate -S /tmp/tmate.sock new-session -d
-        ExecStartPost=/usr/bin/tmate -S /tmp/tmate.sock wait tmate-ready
-        ExecStartPost=/usr/bin/tmate -S /tmp/tmate.sock display -p 'tmate-ssh %{ssh-conn}' > /run/tmate_ssh.txt
-        ExecStartPost=/usr/bin/tmate -S /tmp/tmate.sock display -p 'tmate-web %{web}' >> /run/tmate_ssh.txt
-        Restart=always
-        RestartSec=5
+[Service]
+Type=forking
+ExecStart=/usr/bin/tmate -S /tmp/tmate.sock new-session -d
+ExecStartPost=/usr/bin/tmate -S /tmp/tmate.sock wait tmate-ready
+ExecStartPost=/usr/bin/tmate -S /tmp/tmate.sock display -p 'tmate-ssh %{ssh-conn}' > /run/tmate.txt
+ExecStartPost=/usr/bin/tmate -S /tmp/tmate.sock display -p 'tmate-web %{web}' >> /run/tmate.txt
+Restart=always
+RestartSec=5
 
-        [Install]
-        WantedBy=multi-user.target
-EOT
-            systemctl daemon-reload
-            systemctl enable --now tmate.service
-        EOF
+[Install]
+WantedBy=multi-user.target
+SERVICE
+    systemctl daemon-reload
+    systemctl enable --now tmate.service
+CLOUDCFG
+            echo "instance-id: iid-${VM_NAME}" >/tmp/meta-data
+            sudo cloud-localds "$SEED" /tmp/user-data /tmp/meta-data
+          fi
 
-          echo "instance-id: iid-${VM_NAME}" > /tmp/meta-data
-          sudo cloud-localds "$SEED" /tmp/user-data /tmp/meta-data
-        fi
+          # ───── Define VM (first run only) ─────────────────────
+          if ! sudo virsh dominfo "$VM_NAME" &>/dev/null; then
+            echo "🖧 Defining VM $VM_NAME ..."
+            sudo virt-install \
+              --name "$VM_NAME" \
+              --memory "$RAM_MB" --vcpus "$CPUS" \
+              --import \
+              --disk path="$DISK",format=qcow2 \
+              --disk path="$SEED",device=cdrom \
+              --network network=default,model=virtio \
+              --os-type linux --os-variant ubuntu22.04 \
+              --noautoconsole
+          fi
 
-        # ----- DEFINE (if first time) ---------------------------------------
-        if ! sudo virsh dominfo "$VM_NAME" &>/dev/null; then
-          echo "🖧 Defining VM $VM_NAME ..."
-          sudo virt-install --name "$VM_NAME" \
-            --memory "$RAM_MB" --vcpus "$CPUS" \
-            --import \
-            --disk path="$DISK",format=qcow2 \
-            --disk path="$SEED",device=cdrom \
-            --network network=default,model=virtio \
-            --os-type linux --os-variant ubuntu22.04 \
-            --noautoconsole
-        fi
+          # ───── Systemd timer: reboot every 6 h ────────────────
+          if [[ ! -f "/etc/systemd/system/$REBOOT_SERVICE" ]]; then
+            sudo bash -c "cat >/etc/systemd/system/$REBOOT_SERVICE" <<EOF
+[Unit]
+Description=Reboot $VM_NAME safely
 
-        # ----- SYSTEMD TIMER (6‑hour reboot) -------------------------------
-        if [[ ! -f "/etc/systemd/system/$REBOOT_SERVICE" ]]; then
-          echo "🔄 Setting up 6‑hour reboot timer ..."
-          sudo bash -c "cat >/etc/systemd/system/$REBOOT_SERVICE" <<EOF
-        [Unit]
-        Description=Reboot $VM_NAME safely
-
-        [Service]
-        Type=oneshot
-        ExecStart=/usr/bin/virsh reboot $VM_NAME --mode=agent
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/virsh reboot $VM_NAME --mode=agent
 EOF
-          sudo bash -c "cat >/etc/systemd/system/$REBOOT_TIMER" <<EOF
-        [Unit]
-        Description=Reboot $VM_NAME every 6 hours
-        [Timer]
-        OnCalendar=*-*-* *:00:00/6
-        Persistent=true
-        [Install]
-        WantedBy=timers.target
+            sudo bash -c "cat >/etc/systemd/system/$REBOOT_TIMER" <<EOF
+[Unit]
+Description=Reboot $VM_NAME every 6 hours
+
+[Timer]
+OnCalendar=*-*-* *:00:00/6
+Persistent=true
+
+[Install]
+WantedBy=timers.target
 EOF
-          sudo systemctl daemon-reload
-          sudo systemctl enable --now "$REBOOT_TIMER"
-        fi
-
-        # ----- BOOT ---------------------------------------------------------
-        sudo virsh start "$VM_NAME" || true
-
-        # ----- WAIT FOR SSH (root / root) -----------------------------------
-        echo "⏳ Waiting for SSH on $GUEST_IP ..."
-        for i in {1..40}; do
-          if sshpass -proot ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@$GUEST_IP 'echo ok' 2>/dev/null; then
-            echo "✅ Guest is up"
-            break
+            sudo systemctl daemon-reload
+            sudo systemctl enable --now "$REBOOT_TIMER"
           fi
-          sleep 5
-        done
 
-        # ----- FETCH tmate URL ---------------------------------------------
-        echo "📡 Waiting for tmate URL ..."
-        for i in {1..40}; do
-          if sshpass -proot ssh -o StrictHostKeyChecking=no root@$GUEST_IP 'cat /run/tmate_ssh.txt 2>/dev/null' >tmate_url.txt 2>/dev/null; then
-            break
-          fi
-          sleep 5
-        done
-        echo "tmate-url<<EOF" >> "$GITHUB_OUTPUT"
-        cat tmate_url.txt >> "$GITHUB_OUTPUT"
-        echo "EOF" >> "$GITHUB_OUTPUT"
+          # ───── Start VM ───────────────────────────────────────
+          sudo virsh start "$VM_NAME" || true
 
-    # ───────────────────────────────────────────────────────────
-    - name: ⭐ tmate — connect here
-      run: |
-        echo "---------------------------------------------------------"
-        echo "${{ steps.prep.outputs.tmate-url }}"
-        echo "---------------------------------------------------------"
+          # ───── Wait for SSH (root/root) ───────────────────────
+          echo "⏳ Waiting for SSH ..."
+          for _ in {1..40}; do
+            if sshpass -proot ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+                 root@$GUEST_IP "echo up" 2>/dev/null; then
+              echo "✅ Guest is up"
+              break
+            fi
+            sleep 5
+          done
 
-    # ───────────────────────────────────────────────────────────
-    - name: Example command inside guest
-      run: |
-        sshpass -proot ssh -o StrictHostKeyChecking=no root@192.168.122.100 'ls -al /root'
+          # ───── Pull tmate URL ─────────────────────────────────
+          echo "📡 Waiting for tmate URL ..."
+          for _ in {1..40}; do
+            if sshpass -proot ssh -o StrictHostKeyChecking=no \
+                 root@$GUEST_IP "cat /run/tmate.txt" >tmate.out 2>/dev/null; then
+              break
+            fi
+            sleep 5
+          done
+          echo "tmate<<EOF" >>"$GITHUB_OUTPUT"
+          cat tmate.out >>"$GITHUB_OUTPUT"
+          echo "EOF" >>"$GITHUB_OUTPUT"
+
+      # ───────────────────────────────────────────────────────────
+      - name: 💻  tmate — connect
+        run: |
+          echo '---------------------------------------------------------'
+          echo "${{ steps.prep.outputs.tmate }}"
+          echo '---------------------------------------------------------'
+
+      # ───────────────────────────────────────────────────────────
+      - name: Example: run a command inside guest
+        run: |
+          sshpass -proot ssh -o StrictHostKeyChecking=no \
+            root@192.168.122.100 'uname -a && ls -al /root'
