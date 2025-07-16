@@ -1,35 +1,35 @@
-name: Persistent QEMU VM with Auto-Restart
+name: Persistent Fast QEMU VM (Lightwget Style)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */5 * * *'  # Every 5 hours
+    - cron: '0 */5 * * *'  # Restart every 5 hours
 
 jobs:
-  persistent-vm:
+  vm-job:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
     - name: Install dependencies
       run: |
         sudo apt update
-        sudo apt install -y qemu-kvm cloud-image-utils genisoimage openssh-client wget tmate
+        sudo apt install -y qemu-system-x86 qemu-utils cloud-image-utils genisoimage wget tmate gh
 
-    - name: Restore persistent disk
-      id: restore
+    - name: Restore persistent disk or create new
       run: |
-        if curl -s -f -O -L "https://github.com/${{ github.repository }}/releases/download/vm-disk/persistent.img"; then
-          echo "Disk restored from release."
+        echo "Downloading persistent disk if exists..."
+        if gh release view vm-disk &>/dev/null; then
+          gh release download vm-disk -p persistent.img
+          echo "Disk restored!"
         else
-          echo "No previous disk found, creating new one."
-          qemu-img create -f qcow2 persistent.img 10G
+          echo "Creating persistent disk for first time..."
+          wget -q https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img -O base.img
+          qemu-img create -f qcow2 -b base.img -F qcow2 persistent.img 10G
         fi
 
-    - name: Download Ubuntu cloud image
-      run: |
-        wget -q https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img -O ubuntu.img
-
-    - name: Create cloud-init config (auto root login)
+    - name: Create cloud-init (first-time root setup)
       run: |
         mkdir -p seed
         echo "instance-id: githubvm" > seed/meta-data
@@ -38,7 +38,7 @@ jobs:
         users:
           - name: root
             ssh-authorized-keys:
-              - $(curl -s https://api.github.com/repos/${{ github.repository_owner }}/keys | grep '"key":' | head -n1 | cut -d'"' -f4)
+              - $(curl -s https://api.github.com/users/${{ github.actor }}/keys | grep '"key":' | head -n1 | cut -d'"' -f4)
             sudo: ALL=(ALL) NOPASSWD:ALL
             shell: /bin/bash
         ssh_pwauth: false
@@ -46,34 +46,40 @@ jobs:
         EOF
         cloud-localds seed.img seed/user-data seed/meta-data
 
-    - name: Launch VM with restored disk
+    - name: Boot VM with persistent disk only
       run: |
         nohup qemu-system-x86_64 \
           -enable-kvm \
           -m 16000 -smp 4 \
-          -drive file=persistent.img,format=qcow2 \
-          -drive file=ubuntu.img,format=qcow2 \
+          -drive file=persistent.img,format=qcow2,if=virtio \
           -drive file=seed.img,format=raw \
           -net nic -net user,hostfwd=tcp::2222-:22 \
           -nographic > vm.log 2>&1 &
+        echo $! > vm.pid
 
-    - name: Wait for VM SSH to be ready
+    - name: Wait for VM SSH
       run: |
         for i in {1..30}; do
-          nc -z localhost 2222 && echo "VM is up!" && break
-          echo "Waiting for VM SSH..."
-          sleep 3
+          nc -z localhost 2222 && echo "VM ready!" && break
+          echo "Waiting..."
+          sleep 2
         done
 
-    - name: Start tmate for terminal access
+    - name: Start tmate session
       uses: mxschmitt/action-tmate@v3
-      with:
-        limit-access-to-actor: false
 
-    - name: Upload persistent disk for next run
+    - name: Shutdown VM
+      run: |
+        if [ -f vm.pid ]; then
+          kill $(cat vm.pid)
+        fi
+        sleep 5
+
+    - name: Upload updated disk to GitHub
       if: always()
       run: |
-        curl -sL https://github.com/${{ github.repository }}/releases/download/vm-disk/persistent.img && echo "Backup already exists" && exit 0
-        gh release create vm-disk persistent.img -t "VM Disk Backup" -n "Auto backup of persistent disk"
+        echo "Replacing old release..."
+        gh release delete vm-disk --yes || true
+        gh release create vm-disk persistent.img -t "VM Disk" -n "Auto backup"
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
