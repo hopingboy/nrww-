@@ -1,124 +1,27 @@
-name: KVM‑Ubuntu‑22.04 VM with tmate
+name: Run Ubuntu VM
 
 on:
-  push:
   workflow_dispatch:
 
 jobs:
-  kvm:
-    runs-on: self-hosted    # host must expose /dev/kvm
+  run-vm:
+    runs-on: ubuntu-latest
     steps:
-      - name: Boot persistent VM & expose tmate
-        id: vm
-        shell: bash
+      - name: Install QEMU
         run: |
-          set -euo pipefail
+          sudo apt update
+          sudo apt install -y qemu-system-x86 qemu-utils
 
-          # ── Config ────────────────────────────────────────────
-          VM_NAME="gha-vm"
-          WORKDIR="/var/lib/vm-images"
-          BASE_IMG="$WORKDIR/ubuntu-22.04-base.qcow2"
-          VM_IMG="$WORKDIR/${VM_NAME}.qcow2"
-          SEED_IMG="$WORKDIR/${VM_NAME}-seed.img"
-          RAM=2048
-          CPUS=2
-          DISK_SIZE=10G
-          IMG_URL="https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img"
-          GUEST_IP="192.168.122.100"
-          SSH_PASS="root"
-
-          sudo mkdir -p "$WORKDIR"
-          sudo apt-get update -qq
-          sudo apt-get install -yqq \
-            qemu-system-x86 qemu-utils libvirt-daemon-system libvirt-clients \
-            cloud-image-utils sshpass tmate wget
-          sudo systemctl enable --now libvirtd
-
-          # ── Base image (download once) ───────────────────────
-          if [[ ! -f "$BASE_IMG" ]]; then
-            wget -qO "$BASE_IMG" "$IMG_URL"
-            qemu-img resize "$BASE_IMG" "$DISK_SIZE"
-          fi
-
-          # ── Persistent diff‑disk ─────────────────────────────
-          [[ -f "$VM_IMG" ]] || qemu-img create -f qcow2 -b "$BASE_IMG" "$VM_IMG"
-
-          # ── cloud‑init seed (root / root + tmate) ────────────
-          if [[ ! -f "$SEED_IMG" ]]; then
-            cat >user-data <<'EOF'
-#cloud-config
-disable_root: false
-ssh_pwauth: true
-password: root
-chpasswd: { expire: false }
-runcmd:
-  - apt-get update -qq
-  - apt-get install -yqq tmate
-  - |
-    cat >/etc/systemd/system/tmate.service <<'EOT'
-[Unit]
-Description=tmate session
-After=network.target cloud-final.service
-
-[Service]
-Type=forking
-ExecStart=/usr/bin/tmate -S /tmp/tmate.sock new-session -d
-ExecStartPost=/usr/bin/tmate -S /tmp/tmate.sock wait tmate-ready
-ExecStartPost=/usr/bin/tmate -S /tmp/tmate.sock display -p 'tmate-ssh %{ssh-conn}' > /run/tmate.txt
-ExecStartPost=/usr/bin/tmate -S /tmp/tmate.sock display -p 'tmate-web %{web}' >> /run/tmate.txt
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOT
-    systemctl daemon-reload
-    systemctl enable --now tmate.service
-EOF
-            echo "instance-id: iid-${VM_NAME}" >meta-data
-            sudo cloud-localds "$SEED_IMG" user-data meta-data
-          fi
-
-          # ── Define VM (first time only) ──────────────────────
-          if ! sudo virsh dominfo "$VM_NAME" &>/dev/null; then
-            sudo virt-install --name "$VM_NAME" \
-              --memory "$RAM" --vcpus "$CPUS" \
-              --import \
-              --disk path="$VM_IMG",format=qcow2 \
-              --disk path="$SEED_IMG",device=cdrom \
-              --network network=default,model=virtio \
-              --os-variant ubuntu22.04 \
-              --noautoconsole
-          fi
-
-          # ── Start VM if not already running ─────────────────
-          sudo virsh start "$VM_NAME" || true
-
-          # ── Wait for SSH readiness ──────────────────────────
-          for _ in {1..40}; do
-            if sshpass -p"$SSH_PASS" \
-                 ssh -oStrictHostKeyChecking=no -oConnectTimeout=5 \
-                 root@$GUEST_IP "echo ready" &>/dev/null; then
-              break
-            fi
-            sleep 5
-          done
-
-          # ── Grab tmate URL from guest ───────────────────────
-          for _ in {1..40}; do
-            if sshpass -p"$SSH_PASS" \
-                 ssh -oStrictHostKeyChecking=no root@$GUEST_IP \
-                 "cat /run/tmate.txt" >tmate.txt 2>/dev/null; then
-              break
-            fi
-            sleep 5
-          done
-
-          echo "tmate<<EOF" >>"$GITHUB_OUTPUT"
-          cat tmate.txt >>"$GITHUB_OUTPUT"
-          echo "EOF" >>"$GITHUB_OUTPUT"
-
-      - name: Show tmate connection info
+      - name: Download Ubuntu Cloud Image
         run: |
-          echo "Connect with:"
-          echo "${{ steps.vm.outputs.tmate }}"
+          curl -LO https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img
+
+      - name: Run Ubuntu VM in background
+        run: |
+          qemu-system-x86_64 \
+            -nographic \
+            -m 2048 \
+            -smp 2 \
+            -hda focal-server-cloudimg-amd64.img \
+            -net nic -net user,hostfwd=tcp::2222-:22 \
+            -enable-kvm &
